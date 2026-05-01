@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  crypto-intelligence:
+    build:
+      context: .
+      dockerfile: crypto-intelligence-api/Dockerfile
+    ports:
+      - "8001:8001"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - COINGECKO_API_KEY=${COINGECKO_API_KEY}
+    restart: unless-stopped
+
+  pincode:
+    build:
+      context: .
+      dockerfile: pincode-api/Dockerfile
+    ports:
+      - "8002:8002"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
+
+  food-intelligence:
+    build:
+      context: .
+      dockerfile: food-intelligence-api/Dockerfile
+    ports:
+      - "8003:8003"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
+
+  news-sentiment:
+    build:
+      context: .
+      dockerfile: news-sentiment-api/Dockerfile
+    ports:
+      - "8004:8004"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - NEWS_API_KEY=${NEWS_API_KEY}
+      - HUGGINGFACE_API_KEY=${HUGGINGFACE_API_KEY}
+    restart: unless-stopped
+
+  cricket-stats:
+    build:
+      context: .
+      dockerfile: cricket-stats-api/Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+      - CRICKET_API_KEY=${CRICKET_API_KEY}
+    restart: unless-stopped
