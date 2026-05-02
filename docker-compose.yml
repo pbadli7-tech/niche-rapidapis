@@ -59,3 +59,14 @@ services:
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
       - CRICKET_API_KEY=${CRICKET_API_KEY}
     restart: unless-stopped
+
+  linkedin-jobs:
+    build:
+      context: .
+      dockerfile: linkedin-jobs-api/Dockerfile
+    ports:
+      - "8006:8006"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
