@@ -10,11 +10,7 @@ Transforms raw LinkedIn job listings into structured market intelligence:
   GET /trending     — Fastest-growing roles in a location (by posting volume)
 """
 
-import os
-import sys
 import asyncio
-
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import httpx
 from fastapi import FastAPI, HTTPException, Depends, Query
