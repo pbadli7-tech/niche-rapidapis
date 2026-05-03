@@ -70,3 +70,14 @@ services:
       - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
     restart: unless-stopped
+
+  job-intelligence:
+    build:
+      context: .
+      dockerfile: job-intelligence-api/Dockerfile
+    ports:
+      - "8007:8007"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
