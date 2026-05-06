@@ -81,3 +81,36 @@ services:
       - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
     restart: unless-stopped
+
+  stock-market:
+    build:
+      context: .
+      dockerfile: stock-market-api/Dockerfile
+    ports:
+      - "8008:8008"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
+
+  website-intelligence:
+    build:
+      context: .
+      dockerfile: website-intelligence-api/Dockerfile
+    ports:
+      - "8009:8009"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
+
+  email-validator:
+    build:
+      context: .
+      dockerfile: email-validator-api/Dockerfile
+    ports:
+      - "8010:8010"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
