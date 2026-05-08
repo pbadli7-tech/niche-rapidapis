@@ -3,7 +3,10 @@ Stock Market Intelligence API
 ------------------------------
 Real-time quotes, analyst ratings, earnings, news, and comparison
 for any ticker on NYSE / NASDAQ / global exchanges.
-Powered by yfinance (Yahoo Finance) — no API key required.
+
+Uses Yahoo Finance public HTTP endpoints directly (no yfinance dependency).
+This bypasses yfinance's brittle scraping and works reliably on cloud IPs
+that Yahoo otherwise rate-limits.
 
 Endpoints
   GET /quote/{symbol}          Real-time quote + key fundamentals
@@ -16,29 +19,274 @@ Endpoints
 import os
 import sys
 import time
-from typing import Optional, List
+import asyncio
+import math
+from typing import Optional, List, Dict, Any
+from xml.etree import ElementTree as ET
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-import yfinance as yf
+import httpx
 from fastapi import FastAPI, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
 
 from common.auth import verify_rapidapi_request
 from common.cache import TTLCache
 from common.response import success
 
-_cache = TTLCache(maxsize=500, ttl=120)  # 2-min TTL for market data
-_executor = ThreadPoolExecutor(max_workers=10)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+YAHOO_BASE = "https://query1.finance.yahoo.com"
+YAHOO_BASE_2 = "https://query2.finance.yahoo.com"
+
+_cache = TTLCache(maxsize=500, ttl=120)
 
 
+# ---------------------------------------------------------------------------
+# Yahoo Finance HTTP client with crumb authentication
+# ---------------------------------------------------------------------------
+class YahooFinanceClient:
+    """Async client for Yahoo's public-but-crumb-gated finance endpoints."""
+
+    def __init__(self):
+        self._cookies: Dict[str, str] = {}
+        self._crumb: Optional[str] = None
+        self._session_expires: float = 0.0
+        self._lock = asyncio.Lock()
+
+    async def _ensure_session(self):
+        """Refresh cookie + crumb every 30 minutes."""
+        if self._crumb and time.time() < self._session_expires:
+            return
+        async with self._lock:
+            if self._crumb and time.time() < self._session_expires:
+                return
+            async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=True
+            ) as client:
+                # 1. Hit a Yahoo entry point to obtain consent cookies.
+                try:
+                    r = await client.get(
+                        "https://fc.yahoo.com",
+                        headers={"User-Agent": USER_AGENT},
+                    )
+                    self._cookies = dict(r.cookies)
+                except Exception:
+                    self._cookies = {}
+                # 2. Fetch crumb token.
+                try:
+                    r = await client.get(
+                        f"{YAHOO_BASE}/v1/test/getcrumb",
+                        cookies=self._cookies,
+                        headers={"User-Agent": USER_AGENT},
+                    )
+                    self._crumb = r.text.strip() or None
+                except Exception:
+                    self._crumb = None
+            self._session_expires = time.time() + 1800
+
+    async def chart(
+        self, symbol: str, range_: str = "1mo", interval: str = "1d"
+    ) -> Dict[str, Any]:
+        """Free, no-auth endpoint. Returns price meta + OHLCV history."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{YAHOO_BASE}/v8/finance/chart/{symbol}",
+                params={"interval": interval, "range": range_},
+                headers={"User-Agent": USER_AGENT},
+            )
+            data = r.json()
+        if not data.get("chart") or data["chart"].get("error"):
+            err = (data.get("chart") or {}).get("error") or {}
+            raise HTTPException(
+                status_code=404,
+                detail=err.get("description") or f"No data for {symbol}",
+            )
+        results = data["chart"].get("result") or []
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No data for {symbol}")
+        return results[0]
+
+    async def quote_summary(
+        self, symbol: str, modules: List[str]
+    ) -> Dict[str, Any]:
+        """Crumb-gated. Returns rich fundamentals."""
+        await self._ensure_session()
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{YAHOO_BASE}/v10/finance/quoteSummary/{symbol}",
+                params={
+                    "modules": ",".join(modules),
+                    "crumb": self._crumb or "",
+                },
+                cookies=self._cookies,
+                headers={"User-Agent": USER_AGENT},
+            )
+            data = r.json()
+        # Retry once with refreshed crumb on auth failure
+        if (data.get("finance") or {}).get("error"):
+            self._crumb = None
+            await self._ensure_session()
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.get(
+                    f"{YAHOO_BASE}/v10/finance/quoteSummary/{symbol}",
+                    params={
+                        "modules": ",".join(modules),
+                        "crumb": self._crumb or "",
+                    },
+                    cookies=self._cookies,
+                    headers={"User-Agent": USER_AGENT},
+                )
+                data = r.json()
+        results = (data.get("quoteSummary") or {}).get("result") or []
+        if not results:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No fundamentals available for {symbol}",
+            )
+        return results[0]
+
+    async def screener(self, scr_id: str, count: int = 20) -> List[Dict[str, Any]]:
+        """Screener for movers — uses public predefined screeners."""
+        await self._ensure_session()
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"{YAHOO_BASE}/v1/finance/screener",
+                params={
+                    "crumb": self._crumb or "",
+                    "lang": "en-US",
+                    "region": "US",
+                    "formatted": "false",
+                },
+                cookies=self._cookies,
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "size": count,
+                    "offset": 0,
+                    "sortField": "percentchange",
+                    "sortType": "DESC",
+                    "quoteType": "EQUITY",
+                    "topOperator": "AND",
+                    "query": {
+                        "operator": "AND",
+                        "operands": [
+                            {
+                                "operator": "or",
+                                "operands": [
+                                    {
+                                        "operator": "EQ",
+                                        "operands": ["region", "us"],
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    "userId": "",
+                    "userIdType": "guid",
+                },
+            )
+            data = r.json()
+        # Try the simpler "predefined" screener first
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    f"{YAHOO_BASE}/v1/finance/screener/predefined/saved",
+                    params={
+                        "scrIds": scr_id,
+                        "count": count,
+                        "crumb": self._crumb or "",
+                    },
+                    cookies=self._cookies,
+                    headers={"User-Agent": USER_AGENT},
+                )
+                pdata = r.json()
+            results = (pdata.get("finance") or {}).get("result") or []
+            if results and results[0].get("quotes"):
+                return results[0]["quotes"]
+        except Exception:
+            pass
+        results = (data.get("finance") or {}).get("result") or []
+        if not results:
+            return []
+        return results[0].get("quotes", [])
+
+    async def search(self, query: str, count: int = 10) -> List[Dict[str, Any]]:
+        """Symbol search."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"{YAHOO_BASE_2}/v1/finance/search",
+                params={"q": query, "quotesCount": count, "newsCount": 0},
+                headers={"User-Agent": USER_AGENT},
+            )
+            data = r.json()
+        return data.get("quotes", [])
+
+    async def news_rss(self, symbol: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Fetch news from Yahoo's public RSS feed (no auth)."""
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.get(
+                f"https://feeds.finance.yahoo.com/rss/2.0/headline",
+                params={"s": symbol, "region": "US", "lang": "en-US"},
+                headers={"User-Agent": USER_AGENT},
+            )
+            xml = r.text
+        items = []
+        try:
+            root = ET.fromstring(xml)
+            for item in root.iter("item"):
+                if len(items) >= limit:
+                    break
+                items.append({
+                    "title": item.findtext("title"),
+                    "publisher": item.findtext("source") or "Yahoo Finance",
+                    "published_at": item.findtext("pubDate"),
+                    "url": item.findtext("link"),
+                    "summary": item.findtext("description"),
+                    "thumbnail": None,
+                })
+        except ET.ParseError:
+            pass
+        return items
+
+
+_yc = YahooFinanceClient()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _raw(v: Any) -> Any:
+    """Yahoo wraps numbers as {"raw": x, "fmt": "..."}. Unwrap them."""
+    if isinstance(v, dict) and "raw" in v:
+        return v["raw"]
+    return v
+
+
+def _safe_val(v: Any) -> Any:
+    if v is None:
+        return None
+    v = _raw(v)
+    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+        return None
+    return v
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     yield
-    _executor.shutdown(wait=False)
 
 
 app = FastAPI(
@@ -48,7 +296,7 @@ app = FastAPI(
         "for 50,000+ tickers on NYSE, NASDAQ, and global exchanges. "
         "Get buy/sell/hold consensus, price targets, earnings surprises, and latest news in one call."
     ),
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -60,34 +308,6 @@ app.add_middleware(
 )
 
 
-def _run_sync(fn, *args):
-    """Run a blocking yfinance call in the thread pool."""
-    loop = asyncio.get_event_loop()
-    return loop.run_in_executor(_executor, fn, *args)
-
-
-def _safe_val(v):
-    """Convert non-serialisable types (Timestamp, NaN, inf) to safe values."""
-    import math
-    import pandas as pd
-    if v is None:
-        return None
-    if isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
-        return None
-    try:
-        if hasattr(v, "isoformat"):
-            return v.isoformat()
-        if hasattr(v, "item"):        # numpy scalar
-            return v.item()
-    except Exception:
-        pass
-    return v
-
-
-def _clean(d: dict) -> dict:
-    return {k: _safe_val(v) for k, v in d.items()}
-
-
 # ---------------------------------------------------------------------------
 # Root
 # ---------------------------------------------------------------------------
@@ -95,9 +315,9 @@ def _clean(d: dict) -> dict:
 async def root():
     return {
         "api": "Stock Market Intelligence API",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "docs": "/docs",
-        "data_source": "Yahoo Finance (via yfinance)",
+        "data_source": "Yahoo Finance (direct HTTP)",
     }
 
 
@@ -120,51 +340,88 @@ async def get_quote(symbol: str):
     if cached:
         return success(cached)
 
-    def fetch():
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        if not info or info.get("regularMarketPrice") is None and info.get("currentPrice") is None:
-            return None
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        return {
-            "symbol": symbol,
-            "name": info.get("longName") or info.get("shortName"),
-            "exchange": info.get("exchange"),
-            "currency": info.get("currency"),
-            "sector": info.get("sector"),
-            "industry": info.get("industry"),
-            "price": price,
-            "previous_close": info.get("previousClose"),
-            "open": info.get("open"),
-            "day_low": info.get("dayLow"),
-            "day_high": info.get("dayHigh"),
-            "week_52_low": info.get("fiftyTwoWeekLow"),
-            "week_52_high": info.get("fiftyTwoWeekHigh"),
-            "volume": info.get("volume"),
-            "avg_volume": info.get("averageVolume"),
-            "market_cap": info.get("marketCap"),
-            "pe_ratio": _safe_val(info.get("trailingPE")),
-            "forward_pe": _safe_val(info.get("forwardPE")),
-            "eps": _safe_val(info.get("trailingEps")),
-            "dividend_yield": _safe_val(info.get("dividendYield")),
-            "beta": _safe_val(info.get("beta")),
-            "price_to_book": _safe_val(info.get("priceToBook")),
-            "profit_margin": _safe_val(info.get("profitMargins")),
-            "revenue_growth": _safe_val(info.get("revenueGrowth")),
-            "earnings_growth": _safe_val(info.get("earningsGrowth")),
-            "short_ratio": _safe_val(info.get("shortRatio")),
-            "analyst_target_price": _safe_val(info.get("targetMeanPrice")),
-            "recommendation": info.get("recommendationKey"),
+    # Pull rich fundamentals from quoteSummary; fall back to chart meta on failure.
+    fundamentals: Dict[str, Any] = {}
+    try:
+        qs = await _yc.quote_summary(
+            symbol,
+            [
+                "price",
+                "summaryDetail",
+                "financialData",
+                "defaultKeyStatistics",
+                "assetProfile",
+            ],
+        )
+        price = qs.get("price") or {}
+        sd = qs.get("summaryDetail") or {}
+        fd = qs.get("financialData") or {}
+        ks = qs.get("defaultKeyStatistics") or {}
+        ap = qs.get("assetProfile") or {}
+        fundamentals = {
+            "name": price.get("longName") or price.get("shortName"),
+            "exchange": price.get("exchangeName"),
+            "currency": price.get("currency"),
+            "sector": ap.get("sector"),
+            "industry": ap.get("industry"),
+            "price": _safe_val(price.get("regularMarketPrice")),
+            "previous_close": _safe_val(price.get("regularMarketPreviousClose")),
+            "open": _safe_val(price.get("regularMarketOpen")),
+            "day_low": _safe_val(price.get("regularMarketDayLow")),
+            "day_high": _safe_val(price.get("regularMarketDayHigh")),
+            "week_52_low": _safe_val(sd.get("fiftyTwoWeekLow")),
+            "week_52_high": _safe_val(sd.get("fiftyTwoWeekHigh")),
+            "volume": _safe_val(price.get("regularMarketVolume")),
+            "avg_volume": _safe_val(sd.get("averageVolume")),
+            "market_cap": _safe_val(price.get("marketCap")),
+            "pe_ratio": _safe_val(sd.get("trailingPE")),
+            "forward_pe": _safe_val(sd.get("forwardPE")),
+            "eps": _safe_val(ks.get("trailingEps")),
+            "dividend_yield": _safe_val(sd.get("dividendYield")),
+            "beta": _safe_val(sd.get("beta")) or _safe_val(ks.get("beta")),
+            "price_to_book": _safe_val(ks.get("priceToBook")),
+            "profit_margin": _safe_val(fd.get("profitMargins")),
+            "revenue_growth": _safe_val(fd.get("revenueGrowth")),
+            "earnings_growth": _safe_val(fd.get("earningsGrowth")),
+            "short_ratio": _safe_val(ks.get("shortRatio")),
+            "analyst_target_price": _safe_val(fd.get("targetMeanPrice")),
+            "recommendation": fd.get("recommendationKey"),
+        }
+    except Exception:
+        # Fallback: chart endpoint always works (no crumb).
+        chart = await _yc.chart(symbol, range_="5d")
+        meta = chart.get("meta", {})
+        fundamentals = {
+            "name": meta.get("longName") or meta.get("shortName"),
+            "exchange": meta.get("exchangeName"),
+            "currency": meta.get("currency"),
+            "sector": None,
+            "industry": None,
+            "price": meta.get("regularMarketPrice"),
+            "previous_close": meta.get("chartPreviousClose"),
+            "open": None,
+            "day_low": meta.get("regularMarketDayLow"),
+            "day_high": meta.get("regularMarketDayHigh"),
+            "week_52_low": meta.get("fiftyTwoWeekLow"),
+            "week_52_high": meta.get("fiftyTwoWeekHigh"),
+            "volume": meta.get("regularMarketVolume"),
+            "avg_volume": None,
+            "market_cap": None,
+            "pe_ratio": None,
+            "forward_pe": None,
+            "eps": None,
+            "dividend_yield": None,
+            "beta": None,
+            "price_to_book": None,
+            "profit_margin": None,
+            "revenue_growth": None,
+            "earnings_growth": None,
+            "short_ratio": None,
+            "analyst_target_price": None,
+            "recommendation": None,
         }
 
-    try:
-        data = await _run_sync(fetch)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Data fetch error: {e}")
-
-    if not data:
-        raise HTTPException(status_code=404, detail=f"Symbol '{symbol}' not found or no data available")
-
+    data = {"symbol": symbol, **fundamentals}
     _cache.set(key, data)
     return success(data)
 
@@ -188,59 +445,55 @@ async def get_analysis(symbol: str):
     if cached:
         return success(cached)
 
-    def fetch():
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        recs = ticker.recommendations
-        upgrades = ticker.upgrades_downgrades
+    qs = await _yc.quote_summary(
+        symbol,
+        [
+            "recommendationTrend",
+            "upgradeDowngradeHistory",
+            "financialData",
+        ],
+    )
 
-        rec_rows = []
-        if recs is not None and not recs.empty:
-            latest = recs.tail(10)
-            for _, row in latest.iterrows():
-                rec_rows.append({
-                    "period": str(row.name) if hasattr(row, "name") else None,
-                    "strong_buy": int(row.get("strongBuy", 0)),
-                    "buy": int(row.get("buy", 0)),
-                    "hold": int(row.get("hold", 0)),
-                    "sell": int(row.get("sell", 0)),
-                    "strong_sell": int(row.get("strongSell", 0)),
-                })
+    rt = (qs.get("recommendationTrend") or {}).get("trend") or []
+    rec_rows = []
+    for row in rt[:10]:
+        rec_rows.append({
+            "period": row.get("period"),
+            "strong_buy": row.get("strongBuy", 0),
+            "buy": row.get("buy", 0),
+            "hold": row.get("hold", 0),
+            "sell": row.get("sell", 0),
+            "strong_sell": row.get("strongSell", 0),
+        })
 
-        upgrade_rows = []
-        if upgrades is not None and not upgrades.empty:
-            for _, row in upgrades.head(10).iterrows():
-                upgrade_rows.append({
-                    "date": str(row.name)[:10] if hasattr(row, "name") else None,
-                    "firm": row.get("Firm"),
-                    "to_grade": row.get("ToGrade"),
-                    "from_grade": row.get("FromGrade"),
-                    "action": row.get("Action"),
-                })
+    ud = (qs.get("upgradeDowngradeHistory") or {}).get("history") or []
+    upgrade_rows = []
+    for row in ud[:10]:
+        epoch = row.get("epochGradeDate")
+        date_str = (
+            time.strftime("%Y-%m-%d", time.gmtime(epoch)) if epoch else None
+        )
+        upgrade_rows.append({
+            "date": date_str,
+            "firm": row.get("firm"),
+            "to_grade": row.get("toGrade"),
+            "from_grade": row.get("fromGrade"),
+            "action": row.get("action"),
+        })
 
-        return {
-            "symbol": symbol,
-            "recommendation": info.get("recommendationKey"),
-            "recommendation_mean": _safe_val(info.get("recommendationMean")),
-            "number_of_analysts": info.get("numberOfAnalystOpinions"),
-            "target_high": _safe_val(info.get("targetHighPrice")),
-            "target_low": _safe_val(info.get("targetLowPrice")),
-            "target_mean": _safe_val(info.get("targetMeanPrice")),
-            "target_median": _safe_val(info.get("targetMedianPrice")),
-            "current_price": info.get("currentPrice") or info.get("regularMarketPrice"),
-            "upside_potential_pct": round(
-                ((_safe_val(info.get("targetMeanPrice")) or 0) - (info.get("currentPrice") or 0))
-                / max(info.get("currentPrice") or 1, 1) * 100, 2
-            ) if info.get("currentPrice") else None,
-            "recommendation_history": rec_rows,
-            "recent_upgrades_downgrades": upgrade_rows,
-        }
-
-    try:
-        data = await _run_sync(fetch)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Data fetch error: {e}")
-
+    fd = qs.get("financialData") or {}
+    data = {
+        "symbol": symbol,
+        "recommendation_consensus": fd.get("recommendationKey"),
+        "mean_recommendation": _safe_val(fd.get("recommendationMean")),
+        "number_of_analysts": _safe_val(fd.get("numberOfAnalystOpinions")),
+        "target_mean": _safe_val(fd.get("targetMeanPrice")),
+        "target_high": _safe_val(fd.get("targetHighPrice")),
+        "target_low": _safe_val(fd.get("targetLowPrice")),
+        "target_median": _safe_val(fd.get("targetMedianPrice")),
+        "recommendation_trend": rec_rows,
+        "recent_upgrades_downgrades": upgrade_rows,
+    }
     _cache.set(key, data, ttl=900)
     return success(data)
 
@@ -264,55 +517,47 @@ async def get_earnings(symbol: str):
     if cached:
         return success(cached)
 
-    def fetch():
-        ticker = yf.Ticker(symbol)
-        info = ticker.info
-        cal = ticker.calendar
-        earnings_hist = ticker.earnings_history
+    qs = await _yc.quote_summary(
+        symbol,
+        [
+            "earnings",
+            "earningsHistory",
+            "calendarEvents",
+            "defaultKeyStatistics",
+            "summaryDetail",
+        ],
+    )
 
-        history = []
-        if earnings_hist is not None and not earnings_hist.empty:
-            for _, row in earnings_hist.tail(8).iterrows():
-                history.append({
-                    "date": str(row.name)[:10] if hasattr(row, "name") else None,
-                    "eps_estimate": _safe_val(row.get("epsEstimate")),
-                    "eps_actual": _safe_val(row.get("epsActual")),
-                    "eps_surprise": _safe_val(row.get("epsDifference")),
-                    "surprise_pct": _safe_val(row.get("surprisePercent")),
-                })
+    eh = (qs.get("earningsHistory") or {}).get("history") or []
+    history = []
+    for row in eh[-8:]:
+        history.append({
+            "date": (row.get("quarter") or {}).get("fmt"),
+            "eps_estimate": _safe_val(row.get("epsEstimate")),
+            "eps_actual": _safe_val(row.get("epsActual")),
+            "eps_surprise": _safe_val(row.get("epsDifference")),
+            "surprise_pct": _safe_val(row.get("surprisePercent")),
+        })
 
-        next_earnings = None
-        if cal is not None:
-            if hasattr(cal, "get"):
-                ne = cal.get("Earnings Date")
-                if ne is not None:
-                    if hasattr(ne, "__iter__") and not isinstance(ne, str):
-                        ne = list(ne)
-                        next_earnings = str(ne[0])[:10] if ne else None
-                    else:
-                        next_earnings = str(ne)[:10]
-            elif hasattr(cal, "iloc"):
-                try:
-                    next_earnings = str(cal.iloc[0, 0])[:10]
-                except Exception:
-                    pass
+    cal = qs.get("calendarEvents") or {}
+    earnings_dates = (cal.get("earnings") or {}).get("earningsDate") or []
+    next_earnings = None
+    if earnings_dates:
+        first = earnings_dates[0]
+        next_earnings = first.get("fmt") if isinstance(first, dict) else None
 
-        return {
-            "symbol": symbol,
-            "next_earnings_date": next_earnings,
-            "earnings_call_time": None,
-            "trailing_eps": _safe_val(info.get("trailingEps")),
-            "forward_eps": _safe_val(info.get("forwardEps")),
-            "pe_ratio": _safe_val(info.get("trailingPE")),
-            "forward_pe": _safe_val(info.get("forwardPE")),
-            "earnings_history": list(reversed(history)),
-        }
-
-    try:
-        data = await _run_sync(fetch)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Data fetch error: {e}")
-
+    ks = qs.get("defaultKeyStatistics") or {}
+    sd = qs.get("summaryDetail") or {}
+    data = {
+        "symbol": symbol,
+        "next_earnings_date": next_earnings,
+        "earnings_call_time": None,
+        "trailing_eps": _safe_val(ks.get("trailingEps")),
+        "forward_eps": _safe_val(ks.get("forwardEps")),
+        "pe_ratio": _safe_val(sd.get("trailingPE")),
+        "forward_pe": _safe_val(sd.get("forwardPE")),
+        "earnings_history": list(reversed(history)),
+    }
     _cache.set(key, data, ttl=3600)
     return success(data)
 
@@ -336,33 +581,8 @@ async def get_news(
     if cached:
         return success(cached)
 
-    def fetch():
-        ticker = yf.Ticker(symbol)
-        raw = ticker.news or []
-        items = []
-        for n in raw[:limit]:
-            content = n.get("content", {})
-            items.append({
-                "title": content.get("title") or n.get("title"),
-                "publisher": (content.get("provider") or {}).get("displayName") or n.get("publisher"),
-                "published_at": content.get("pubDate") or (
-                    time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(n["providerPublishTime"]))
-                    if n.get("providerPublishTime") else None
-                ),
-                "url": (content.get("canonicalUrl") or {}).get("url") or n.get("link"),
-                "summary": content.get("summary"),
-                "thumbnail": (
-                    ((content.get("thumbnail") or {}).get("resolutions") or [{}])[0].get("url")
-                    if content.get("thumbnail") else None
-                ),
-            })
-        return {"symbol": symbol, "count": len(items), "news": items}
-
-    try:
-        data = await _run_sync(fetch)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=f"Data fetch error: {e}")
-
+    items = await _yc.news_rss(symbol, limit)
+    data = {"symbol": symbol, "count": len(items), "news": items}
     _cache.set(key, data, ttl=300)
     return success(data)
 
@@ -391,41 +611,42 @@ async def compare_stocks(
     if cached:
         return success(cached)
 
-    def fetch_one(sym):
-        info = yf.Ticker(sym).info
-        price = info.get("currentPrice") or info.get("regularMarketPrice")
-        prev = info.get("previousClose")
-        change_pct = round((price - prev) / prev * 100, 2) if price and prev else None
-        return {
-            "symbol": sym,
-            "name": info.get("shortName"),
-            "price": price,
-            "change_pct": change_pct,
-            "market_cap": info.get("marketCap"),
-            "pe_ratio": _safe_val(info.get("trailingPE")),
-            "forward_pe": _safe_val(info.get("forwardPE")),
-            "eps": _safe_val(info.get("trailingEps")),
-            "dividend_yield": _safe_val(info.get("dividendYield")),
-            "beta": _safe_val(info.get("beta")),
-            "week_52_low": info.get("fiftyTwoWeekLow"),
-            "week_52_high": info.get("fiftyTwoWeekHigh"),
-            "analyst_target": _safe_val(info.get("targetMeanPrice")),
-            "recommendation": info.get("recommendationKey"),
-            "sector": info.get("sector"),
-        }
+    async def fetch_one(sym: str):
+        try:
+            qs = await _yc.quote_summary(
+                sym,
+                ["price", "summaryDetail", "financialData", "defaultKeyStatistics", "assetProfile"],
+            )
+            price = qs.get("price") or {}
+            sd = qs.get("summaryDetail") or {}
+            fd = qs.get("financialData") or {}
+            ks = qs.get("defaultKeyStatistics") or {}
+            ap = qs.get("assetProfile") or {}
+            p = _safe_val(price.get("regularMarketPrice"))
+            prev = _safe_val(price.get("regularMarketPreviousClose"))
+            change_pct = round((p - prev) / prev * 100, 2) if p and prev else None
+            return {
+                "symbol": sym,
+                "name": price.get("shortName"),
+                "price": p,
+                "change_pct": change_pct,
+                "market_cap": _safe_val(price.get("marketCap")),
+                "pe_ratio": _safe_val(sd.get("trailingPE")),
+                "forward_pe": _safe_val(sd.get("forwardPE")),
+                "eps": _safe_val(ks.get("trailingEps")),
+                "dividend_yield": _safe_val(sd.get("dividendYield")),
+                "beta": _safe_val(sd.get("beta")),
+                "week_52_low": _safe_val(sd.get("fiftyTwoWeekLow")),
+                "week_52_high": _safe_val(sd.get("fiftyTwoWeekHigh")),
+                "analyst_target": _safe_val(fd.get("targetMeanPrice")),
+                "recommendation": fd.get("recommendationKey"),
+                "sector": ap.get("sector"),
+            }
+        except Exception as e:
+            return {"symbol": sym, "error": str(e)}
 
-    loop = asyncio.get_event_loop()
-    futures = [loop.run_in_executor(_executor, fetch_one, sym) for sym in tickers]
-    results = await asyncio.gather(*futures, return_exceptions=True)
-
-    comparison = []
-    for sym, res in zip(tickers, results):
-        if isinstance(res, Exception):
-            comparison.append({"symbol": sym, "error": str(res)})
-        else:
-            comparison.append(res)
-
-    data = {"symbols": tickers, "count": len(comparison), "comparison": comparison}
+    results = await asyncio.gather(*[fetch_one(s) for s in tickers])
+    data = {"symbols": tickers, "count": len(results), "comparison": results}
     _cache.set(key, data)
     return success(data)
 
@@ -447,7 +668,10 @@ async def get_movers(
 ):
     valid = {"gainers", "losers", "active"}
     if category not in valid:
-        raise HTTPException(status_code=400, detail=f"category must be one of: {', '.join(valid)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"category must be one of: {', '.join(valid)}",
+        )
 
     key = f"movers:{category}"
     cached = _cache.get(key)
@@ -460,32 +684,25 @@ async def get_movers(
         "active": "most_actives",
     }
 
-    def fetch():
-        import yfinance.screener.screener as ys
-        screener = yf.screen(screener_map[category])
-        if screener is None:
-            return []
-        quotes = screener.get("quotes", [])
-        result = []
-        for q in quotes[:20]:
-            result.append({
-                "symbol": q.get("symbol"),
-                "name": q.get("shortName") or q.get("longName"),
-                "price": q.get("regularMarketPrice"),
-                "change": q.get("regularMarketChange"),
-                "change_pct": q.get("regularMarketChangePercent"),
-                "volume": q.get("regularMarketVolume"),
-                "market_cap": q.get("marketCap"),
-                "pe_ratio": _safe_val(q.get("trailingPE")),
-            })
-        return result
+    quotes = await _yc.screener(screener_map[category], count=20)
+    movers = []
+    for q in quotes[:20]:
+        movers.append({
+            "symbol": q.get("symbol"),
+            "name": q.get("shortName") or q.get("longName"),
+            "price": _safe_val(q.get("regularMarketPrice")),
+            "change": _safe_val(q.get("regularMarketChange")),
+            "change_pct": _safe_val(q.get("regularMarketChangePercent")),
+            "volume": _safe_val(q.get("regularMarketVolume")),
+            "market_cap": _safe_val(q.get("marketCap")),
+            "pe_ratio": _safe_val(q.get("trailingPE")),
+        })
 
-    try:
-        movers = await _run_sync(fetch)
-    except Exception as e:
-        # Fallback with well-known symbols if screener fails
-        movers = []
-
-    data = {"category": category, "count": len(movers), "movers": movers, "as_of": int(time.time())}
+    data = {
+        "category": category,
+        "count": len(movers),
+        "movers": movers,
+        "as_of": int(time.time()),
+    }
     _cache.set(key, data, ttl=300)
     return success(data)

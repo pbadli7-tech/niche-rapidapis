@@ -30,7 +30,7 @@ from typing import Optional
 from common.auth import verify_rapidapi_request
 from common.cache import TTLCache
 from common.response import success
-from scraper import search_players, get_player_stats, get_current_matches
+from scraper import search_players, get_player_stats, get_current_matches, get_upcoming_matches
 from fantasy import (
     calculate_batting_points,
     calculate_bowling_points,
@@ -138,8 +138,8 @@ async def live_matches():
 
     try:
         matches = await get_current_matches(_client)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+    except Exception:
+        matches = []
 
     payload = {"matches": matches, "count": len(matches), "fetched_at": int(time.time())}
     _cache.set(key, payload, ttl=60)  # live data — short TTL
@@ -158,21 +158,8 @@ async def upcoming_matches():
     if cached:
         return success(cached)
 
-    if not os.getenv("CRICKET_API_KEY"):
-        raise HTTPException(
-            status_code=503,
-            detail="CRICKET_API_KEY required for upcoming matches. Current matches work without a key.",
-        )
-
     try:
-        import httpx as hx
-        r = await _client.get(
-            "https://api.cricapi.com/v1/matches",
-            params={"apikey": os.getenv("CRICKET_API_KEY"), "offset": 0},
-        )
-        r.raise_for_status()
-        data = r.json()
-        matches = [m for m in data.get("data", []) if m.get("matchStarted") is False]
+        matches = await get_upcoming_matches(_client)
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
 
