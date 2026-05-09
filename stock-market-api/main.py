@@ -114,11 +114,9 @@ class YahooFinanceClient:
             raise HTTPException(status_code=404, detail=f"No data for {symbol}")
         return results[0]
 
-    async def quote_summary(
+    async def _quote_summary_once(
         self, symbol: str, modules: List[str]
     ) -> Dict[str, Any]:
-        """Crumb-gated. Returns rich fundamentals."""
-        await self._ensure_session()
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.get(
                 f"{YAHOO_BASE}/v10/finance/quoteSummary/{symbol}",
@@ -129,22 +127,47 @@ class YahooFinanceClient:
                 cookies=self._cookies,
                 headers={"User-Agent": USER_AGENT},
             )
-            data = r.json()
-        # Retry once with refreshed crumb on auth failure
-        if (data.get("finance") or {}).get("error"):
+            try:
+                return r.json()
+            except Exception:
+                return {}
+
+    @staticmethod
+    def _qs_error(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract error block from a quoteSummary response.
+
+        Yahoo nests errors under "quoteSummary" but older edge paths use
+        "finance". Return the dict if either is present, else None.
+        """
+        for key in ("quoteSummary", "finance"):
+            err = (data.get(key) or {}).get("error") if isinstance(data.get(key), dict) else None
+            if err:
+                return err
+        return None
+
+    async def quote_summary(
+        self, symbol: str, modules: List[str]
+    ) -> Dict[str, Any]:
+        """Crumb-gated. Returns rich fundamentals.
+
+        Retries once with a fresh crumb when Yahoo reports
+        Unauthorized / Invalid Crumb (the cached token has expired).
+        """
+        await self._ensure_session()
+        data = await self._quote_summary_once(symbol, modules)
+        err = self._qs_error(data)
+        if err and err.get("code") in {"Unauthorized", "Invalid Crumb", "Forbidden"}:
+            # Force-refresh and try once more.
             self._crumb = None
+            self._session_expires = 0
             await self._ensure_session()
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(
-                    f"{YAHOO_BASE}/v10/finance/quoteSummary/{symbol}",
-                    params={
-                        "modules": ",".join(modules),
-                        "crumb": self._crumb or "",
-                    },
-                    cookies=self._cookies,
-                    headers={"User-Agent": USER_AGENT},
-                )
-                data = r.json()
+            data = await self._quote_summary_once(symbol, modules)
+            err = self._qs_error(data)
+        if err:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Yahoo error: {err.get('description') or err.get('code') or 'unknown'}",
+            )
         results = (data.get("quoteSummary") or {}).get("result") or []
         if not results:
             raise HTTPException(
