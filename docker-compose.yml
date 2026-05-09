@@ -114,3 +114,14 @@ services:
       - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
       - INTERNAL_API_KEY=${INTERNAL_API_KEY}
     restart: unless-stopped
+
+  pdf-parser:
+    build:
+      context: .
+      dockerfile: pdf-parser-api/Dockerfile
+    ports:
+      - "8011:8011"
+    environment:
+      - RAPIDAPI_PROXY_SECRET=${RAPIDAPI_PROXY_SECRET}
+      - INTERNAL_API_KEY=${INTERNAL_API_KEY}
+    restart: unless-stopped
