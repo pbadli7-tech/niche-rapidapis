@@ -1,5 +1,5 @@
 """
-News Sentiment API
+News Sentiment by DataNest
 ------------------
 Real-time sentiment analysis on news headlines for any topic, company,
 or keyword. Uses HuggingFace RoBERTa model with keyword fallback.
@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 
 from common.auth import verify_rapidapi_request
+from common.logging_middleware import RequestLoggingMiddleware
 from common.cache import TTLCache
 from common.response import success
 from analyzer import hf_sentiment, keyword_sentiment, aggregate_sentiments
@@ -55,6 +56,7 @@ app = FastAPI(
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(RequestLoggingMiddleware)
 
 
 async def _fetch_newsapi(query: str, page_size: int = 10, language: str = "en") -> list:
@@ -80,34 +82,51 @@ async def _fetch_newsapi(query: str, page_size: int = 10, language: str = "en") 
 
 
 async def _fetch_gdelt(query: str, max_records: int = 10) -> list:
-    """GDELT free API — no key needed, returns news articles."""
-    try:
-        r = await _client.get(
-            GDELT_BASE,
-            params={
-                "query": query,
-                "mode": "artlist",
-                "maxrecords": max_records,
-                "format": "json",
-                "timespan": "24h",
-            },
-        )
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        articles = data.get("articles", [])
-        return [
-            {
-                "title": a.get("title", ""),
-                "description": a.get("seendate", ""),
-                "source": {"name": a.get("domain", "")},
-                "url": a.get("url", ""),
-                "publishedAt": a.get("seendate", ""),
-            }
-            for a in articles
-        ]
-    except Exception:
-        return []
+    """GDELT free API — no key needed. Robust across timespans / non-JSON."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; DataNestNews/1.0)",
+        "Accept": "application/json",
+    }
+    # English-language news; widen the window progressively until we get hits.
+    q = f"{query} sourcelang:english"
+    for timespan in ("1d", "3d", "7d"):
+        try:
+            r = await _client.get(
+                GDELT_BASE,
+                params={
+                    "query": q,
+                    "mode": "artlist",
+                    "maxrecords": max(10, max_records),
+                    "format": "json",
+                    "sort": "hybridrel",
+                    "timespan": timespan,
+                },
+                headers=headers,
+            )
+            if r.status_code != 200:
+                continue
+            try:
+                data = r.json()
+            except Exception:
+                # GDELT sometimes returns HTML on throttle — skip, try wider span
+                continue
+            articles = data.get("articles", []) if isinstance(data, dict) else []
+            mapped = [
+                {
+                    "title": a.get("title", ""),
+                    "description": a.get("title", ""),
+                    "source": {"name": a.get("domain", "")},
+                    "url": a.get("url", ""),
+                    "publishedAt": a.get("seendate", ""),
+                }
+                for a in articles
+                if a.get("title")
+            ]
+            if mapped:
+                return mapped
+        except Exception:
+            continue
+    return []
 
 
 async def _articles_with_sentiment(query: str, max_articles: int = 15) -> tuple[list, list]:

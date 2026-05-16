@@ -55,7 +55,7 @@ async def get_current_matches(client: httpx.AsyncClient) -> list:
 
 
 async def get_upcoming_matches(client: httpx.AsyncClient) -> list:
-    """Always returns something — falls back to a static schedule preview if no API key."""
+    """CricAPI (if key) → ESPN Cricinfo (free, no key) → static preview."""
     if CRICKET_API_KEY:
         try:
             r = await client.get(
@@ -64,20 +64,26 @@ async def get_upcoming_matches(client: httpx.AsyncClient) -> list:
             )
             r.raise_for_status()
             data = r.json().get("data", [])
-            return [m for m in data if m.get("matchStarted") in (False, "false")][:20]
+            upcoming = [m for m in data if m.get("matchStarted") in (False, "false")][:20]
+            if upcoming:
+                return upcoming
         except Exception:
             pass
-    # Static placeholder (so endpoint never 503s)
+    # Free fallback: ESPN Cricinfo public API (no key required)
+    espn = await _espn_upcoming_matches(client)
+    if espn:
+        return espn
+    # Last resort so the endpoint never 503s
     return [
         {
             "id": "static-1",
-            "name": "Static Preview — configure CRICKET_API_KEY for live data",
+            "name": "Cricket schedule temporarily unavailable",
             "team1": "—",
             "team2": "—",
             "venue": "TBD",
             "date": "TBD",
             "matchType": "T20",
-            "note": "This is a placeholder. Set CRICKET_API_KEY to fetch real upcoming matches.",
+            "note": "Upstream cricket sources returned no fixtures right now.",
         }
     ]
 
@@ -204,3 +210,35 @@ async def _espn_current_matches(client: httpx.AsyncClient) -> list:
         return matches
     except Exception:
         return []
+
+
+async def _espn_upcoming_matches(client: httpx.AsyncClient) -> list:
+    """Free ESPN Cricinfo upcoming/fixture list — no API key required."""
+    for status in ("upcoming", "fixture", "scheduled"):
+        try:
+            r = await client.get(
+                f"{ESPN_MOBILE}/shared/match/list",
+                params={"status": status, "includedTypes": "INTERNATIONAL,DOMESTIC"},
+            )
+            if r.status_code != 200:
+                continue
+            data = r.json()
+            out = []
+            for m in data.get("content", {}).get("matches", []):
+                teams = m.get("teams", [])
+                out.append({
+                    "id": str(m.get("objectId", "")),
+                    "name": m.get("title", ""),
+                    "team1": (teams[0].get("team", {}).get("longName") if teams else "—"),
+                    "team2": (teams[1].get("team", {}).get("longName") if len(teams) > 1 else "—"),
+                    "venue": m.get("ground", {}).get("longName", "TBD"),
+                    "date": m.get("startTime", "TBD"),
+                    "matchType": m.get("format", "") or m.get("internationalClassId", "T20"),
+                    "series": m.get("series", {}).get("longName", ""),
+                    "status": m.get("statusText", "Scheduled"),
+                })
+            if out:
+                return out[:20]
+        except Exception:
+            continue
+    return []
