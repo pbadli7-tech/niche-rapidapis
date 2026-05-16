@@ -1,5 +1,5 @@
 """
-Food Intelligence API
+Food Intelligence by DataNest
 ---------------------
 Enriched nutrition data, health scoring, allergen detection, and
 healthier-alternative suggestions. Powered by Open Food Facts (free, no key).
@@ -24,6 +24,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from common.auth import verify_rapidapi_request
+from common.logging_middleware import RequestLoggingMiddleware
 from common.cache import TTLCache
 from common.response import success
 from enricher import compute_health_score, detect_allergens, compute_daily_values
@@ -53,6 +54,7 @@ app = FastAPI(
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET"], allow_headers=["*"])
+app.add_middleware(RequestLoggingMiddleware)
 
 
 async def _fetch_product(barcode: str) -> dict:

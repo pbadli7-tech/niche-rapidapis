@@ -1,5 +1,5 @@
 """
-Cricket Fantasy Stats API
+Cricket Stats by DataNest
 --------------------------
 IPL / T20 player stats, live match scores, and Dream11-style fantasy
 point calculations. Primary: CricAPI (key optional). Fallback: ESPN Cricinfo.
@@ -28,6 +28,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from common.auth import verify_rapidapi_request
+from common.logging_middleware import RequestLoggingMiddleware
 from common.cache import TTLCache
 from common.response import success
 from scraper import search_players, get_player_stats, get_current_matches, get_upcoming_matches
@@ -61,6 +62,7 @@ app = FastAPI(
 )
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["GET", "POST"], allow_headers=["*"])
+app.add_middleware(RequestLoggingMiddleware)
 
 
 @app.get("/", include_in_schema=False)
