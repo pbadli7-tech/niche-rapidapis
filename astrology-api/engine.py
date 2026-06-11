@@ -130,6 +130,16 @@ _LOVE = [
     "Boundaries aren't the opposite of love; setting one now actually protects the bond.",
     "A vulnerable moment lands well — the version of you with the guard down is the one people fall for.",
     "Stop keeping score. The relationship breathes easier the second you put the tally down.",
+    "Romance hides in logistics this {period}: the person who handles the boring thing is saying I love you.",
+    "Say what you actually want out loud — hinting is a game where everyone loses politely.",
+    "Someone's actions and words finally line up this {period}; believe whichever one has been consistent.",
+    "Plan one small thing to look forward to together — anticipation is criminally underrated romance.",
+    "If a connection feels heavy, ask whether you're carrying it alone — and put half of it down.",
+    "Compliment the thing they're insecure about doing well; that one lands ten times deeper.",
+    "A slow-burn connection deserves more credit than the fireworks that fizzled — notice who stayed.",
+    "Forgive the small thing fast this {period}; resentment compounds faster than any apology can.",
+    "Your standards aren't too high — your patience for pretending is just finally too low.",
+    "Touch grass together: love does better on a walk than across a table of screens.",
 ]
 _CAREER = [
     "At work, your {trait} instinct spots an opening the rest of the room walked right past.",
@@ -143,6 +153,17 @@ _CAREER = [
     "A 'no' you've been scared to give frees up the energy your real work has been starving for.",
     "Document the thing. The you of two weeks from now will be deeply grateful you did.",
     "Your reputation is built in the boring weeks, and this is one of them — show up anyway.",
+    "Ask the question everyone in the room is too polite to ask — that's leadership this {period}.",
+    "Finish the 90%-done task before starting the exciting new one; closure compounds.",
+    "Someone junior is watching how you work — teach one thing and you'll learn it twice.",
+    "Your inbox is other people's priorities; block one hour this {period} that's purely yours.",
+    "The feedback that stung has one useful sentence in it — keep that line, drop the tone.",
+    "Don't water down the proposal to pre-please everyone; let the strong version meet the room.",
+    "A small process you invent for yourself this {period} becomes the thing the whole team copies.",
+    "Stop rewriting the email — the third draft was right, and the meeting matters more.",
+    "Visibility beats modesty this {period}: share the result, not just the effort.",
+    "If you're bored, that's data — automate it, delegate it, or design your way out of it.",
+    "Practise saying 'here's what I'd need to make that happen' instead of an instant yes.",
 ]
 _MONEY = [
     "Money-wise, hold off on the impulse buy until the {period} settles — the clarity is worth the wait.",
@@ -155,6 +176,11 @@ _MONEY = [
     "Negotiate. The number you're afraid to ask for is closer to fair than you assume.",
     "Markets and moods both swing — make the plan when you're calm, not when you're hyped or scared.",
     "Generosity is fine, but check it's coming from abundance, not from trying to be liked.",
+    "Price your time honestly this {period} — the discount you keep giving is coming out of your future.",
+    "One automated transfer the day you're paid beats twelve budgeting apps you'll never open.",
+    "Before buying the upgrade, use the current thing hard for one more {period} — clarity is free.",
+    "Money talks are easier in daylight: schedule the awkward conversation instead of dreading it nightly.",
+    "Track one category — just one — this {period}; what gets seen quietly fixes itself.",
 ]
 _WELLNESS = [
     "Your body's been sending small signals this {period} — slowing down now beats forced recovery later.",
@@ -167,6 +193,18 @@ _WELLNESS = [
     "Name the feeling instead of numbing it — that alone takes the edge off this {period}.",
     "Rest isn't a reward you earn after burnout; schedule it before you need it.",
     "Be as kind to yourself as you'd be to a friend having the exact same week.",
+    "Your shoulders are up by your ears again — drop them, unclench the jaw, breathe out longer than in.",
+    "Eat the protein, take the stairs, see the sky before noon: boring advice, undefeated results.",
+    "The doom-scroll is a comfort behaviour, not a rest behaviour — swap one session for actual stillness.",
+    "Book the appointment you've been postponing; future-you collects the interest on that ten minutes.",
+    "Stretch for five minutes before bed this {period} — your sleep will repay you with compound interest.",
+    "Notice which person leaves you drained and which leaves you charged; schedule accordingly.",
+    "A tidy corner calms a loud mind — reset one small space and feel the static drop.",
+    "Sunlight in the first hour is a free mood drug; take the dose.",
+    "You don't need a new routine, you need the old one back for three consecutive days.",
+    "Let one evening this {period} be gloriously unproductive on purpose — that's maintenance, not laziness.",
+    "Hunger, anger, loneliness, tiredness — HALT and check the list before believing a dark thought.",
+    "Drink the water before the coffee, just once a day, and watch the afternoons improve.",
 ]
 _SOCIAL = [
     "Socially, the group chat wants your energy this {period} — say yes to the low-effort plan.",
@@ -181,6 +219,9 @@ _SOCIAL = [
     "New people enter your orbit this {period}; the one who asks good questions is worth keeping.",
     "Say the kind thing out loud instead of just thinking it — it lands harder than you know.",
     "You set the emotional thermostat of the room more than you realise; pick the temperature deliberately.",
+    "Be the one who organises the thing this {period} — everyone wants the plan, nobody wants to make it.",
+    "Old friends don't need catching up to be close; send the meme, skip the ceremony.",
+    "Listen for what they're not saying at dinner — the quiet one has the real headline.",
 ]
 _CLOSERS = [
     "Stay open, and this {period} unfolds in your favour more than you'd dare to plan for.",
@@ -265,12 +306,63 @@ def _pick(r: random.Random, bank: list[str], n: int, sign: dict, period: str) ->
 _SIGN_ORDER = {s["name"]: i for i, s in enumerate(SIGNS)}
 
 
+def _week_of(date_key: str) -> tuple[str, int] | None:
+    """ISO week key + weekday (0=Mon) for a YYYY-MM-DD key, else None."""
+    try:
+        d = date.fromisoformat(date_key)
+    except (ValueError, TypeError):
+        return None
+    iso = d.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}", d.weekday()
+
+
+def _week_pick(r: random.Random, bank: list[str], bank_name: str, n: int,
+               sign: dict, period: str, weekkey: str, weekday: int) -> list[str]:
+    """Pick n sentences for one weekday such that NO sentence repeats across
+    the 7 days of the same sign's week: a week-seeded shuffle of the bank is
+    partitioned into 7 disjoint slices (requires len(bank) >= 7*n)."""
+    if len(bank) < 7 * n:
+        return _pick(r, bank, n, sign, period)
+    order = list(range(len(bank)))
+    _rng(sign["name"], weekkey, bank_name).shuffle(order)
+    idxs = order[weekday * n: weekday * n + n]
+    out = []
+    for i in idxs:
+        trait = r.choice(sign["traits"])
+        out.append(bank[i].format(sign=sign["name"], planet=sign["ruling_planet"],
+                                  element=sign["element"], period=period, trait=trait))
+    return out
+
+
+# Weekly overall-rating pattern: exactly one 5-star day, mostly 3s and 4s.
+_WEEK_OVERALL = [5, 4, 4, 4, 3, 3, 4]
+
+
+def week_overall(sign_name: str, date_key: str) -> int | None:
+    wk = _week_of(date_key)
+    if not wk:
+        return None
+    weekkey, weekday = wk
+    pat = _WEEK_OVERALL[:]
+    _rng(sign_name, weekkey, "overall-pattern").shuffle(pat)
+    return pat[weekday]
+
+
 def _unique_opener(r: random.Random, sign: dict, period: str, period_key: str) -> str:
     """Opening sentence guaranteed distinct across all 12 signs for the same
     period_key: a day-level rotation plus a stride-3 per-sign offset walks the
     36-sentence bank so no two signs ever share an opener on the same day —
     the line Google (and homepage visitors) see first is always unique."""
-    base = _seed(period_key, "opener") % len(_OVERVIEW)
+    wk = _week_of(period_key)
+    if wk:
+        # Week-stable base + per-sign stride + weekday offset: openers are
+        # distinct across all 12 signs on the same date AND across all 7 days
+        # of the same sign's week (stride 3 ≥ 12 signs apart mod 35; weekday
+        # 0–6 shifts every sign equally so same-date uniqueness holds).
+        weekkey, weekday = wk
+        base = (_seed(weekkey, "opener") + weekday) % len(_OVERVIEW)
+    else:
+        base = _seed(period_key, "opener") % len(_OVERVIEW)
     idx = (base + _SIGN_ORDER.get(sign["name"], 0) * 3) % len(_OVERVIEW)
     trait = r.choice(sign["traits"])
     return _OVERVIEW[idx].format(sign=sign["name"], planet=sign["ruling_planet"],
@@ -293,14 +385,25 @@ def _compose_sections(r: random.Random, sign: dict, period: str, period_key: str
     else:
         overview = " ".join(_pick(r, _OVERVIEW, n_over, sign, word))
 
+    # Daily readings: partition each bank across the ISO week so no sentence
+    # ever repeats within the same sign's Mon–Sun stretch.
+    wk = _week_of(period_key) if (period == "daily" and period_key) else None
+    if wk:
+        weekkey, weekday = wk
+        def pick(bank, bank_name, n):
+            return _week_pick(r, bank, bank_name, n, sign, word, weekkey, weekday)
+    else:
+        def pick(bank, bank_name, n):
+            return _pick(r, bank, n, sign, word)
+
     sections = {
         "overview": overview,
-        "love": " ".join(_pick(r, _LOVE, lengths["love"], sign, word)),
-        "career": " ".join(_pick(r, _CAREER, lengths["career"], sign, word)),
-        "money": " ".join(_pick(r, _MONEY, lengths["money"], sign, word)),
-        "wellness": " ".join(_pick(r, _WELLNESS, lengths["wellness"], sign, word)),
-        "social": " ".join(_pick(r, _SOCIAL, lengths["social"], sign, word)),
-        "closer": " ".join(_pick(r, _CLOSERS, 1, sign, word)),
+        "love": " ".join(pick(_LOVE, "love", lengths["love"])),
+        "career": " ".join(pick(_CAREER, "career", lengths["career"])),
+        "money": " ".join(pick(_MONEY, "money", lengths["money"])),
+        "wellness": " ".join(pick(_WELLNESS, "wellness", lengths["wellness"])),
+        "social": " ".join(pick(_SOCIAL, "social", lengths["social"])),
+        "closer": " ".join(pick(_CLOSERS, "closer", 1)),
     }
     return sections
 
@@ -341,6 +444,10 @@ def daily_horoscope(
     key = d.isoformat()
     r = _rng(sign["name"], key, "daily")
     ratings = _ratings(r)
+    # Weekly star realism: exactly one 5-star day per sign per week, rest 3–4.
+    wo = week_overall(sign["name"], key)
+    if wo is not None:
+        ratings["overall"] = wo
     sections = _compose_sections(r, sign, "daily", period_key=key)
     return {
         "sign": sign["name"],
